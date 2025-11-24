@@ -6,7 +6,7 @@ export async function firstUzigPool(tokenId) {
   const { rows } = await DB.query(`
     SELECT p.pool_id, p.pair_contract
     FROM pools p
-    WHERE p.base_token_id=$1 AND p.is_uzig_quote=TRUE
+    WHERE p.base_token_id=$1 AND p.is_uzig_quote=1
     ORDER BY p.created_at ASC
     LIMIT 1
   `, [tokenId]);
@@ -20,7 +20,7 @@ export async function bestUzigPool(tokenId) {
     SELECT pr.pool_id, pr.price_in_zig, pr.updated_at, p.pair_contract
     FROM prices pr
     JOIN pools p ON p.pool_id=pr.pool_id
-    WHERE pr.token_id=$1 AND p.is_uzig_quote=TRUE
+    WHERE pr.token_id=$1 AND p.is_uzig_quote=1
     ORDER BY pr.updated_at DESC
     LIMIT 16
   `, [tokenId]);
@@ -29,8 +29,11 @@ export async function bestUzigPool(tokenId) {
 
   const ids = prices.rows.map(r => r.pool_id);
   const tvls = await DB.query(
-    `SELECT pool_id, tvl_zig FROM pool_matrix WHERE bucket='24h' AND pool_id = ANY($1)`,
-    [ids]
+    `
+    SELECT pool_id, tvl_zig
+    FROM pool_matrix
+    WHERE bucket='24h' AND pool_id IN (${ids.map(id => Number(id)).join(',') || 'NULL'})
+    `
   );
   const tvlMap = new Map(tvls.rows.map(r => [String(r.pool_id), Number(r.tvl_zig || 0)]));
 
@@ -64,7 +67,10 @@ export async function resolvePoolSelection(tokenId, { priceSource = 'best', pool
       `SELECT pool_id, pair_contract FROM pools WHERE pool_id=$1 AND base_token_id=$2`,
       [pid, tokenId]
     );
-    return { mode: 'pool', pool: rows[0] ? { pool_id: rows[0].pool_id, pair_contract: rows[0].pair_contract } : null };
+    return {
+      mode: 'pool',
+      pool: rows[0] ? { pool_id: rows[0].pool_id, pair_contract: rows[0].pair_contract } : null
+    };
   }
 
   if (src === 'first') {
@@ -74,20 +80,47 @@ export async function resolvePoolSelection(tokenId, { priceSource = 'best', pool
   return { mode: 'best', pool: await bestUzigPool(tokenId) };
 }
 
-/** % change over N minutes for one pool’s OHLCV stream. */
+/** % change over N minutes for one pool’s OHLCV stream (ClickHouse version). */
 export async function changePctForMinutes(poolId, minutes) {
-  const { rows } = await DB.query(`
+  // guard against bad/undefined poolId so ClickHouse isn’t given 'undefined'
+  if (
+    poolId == null ||
+    poolId === '' ||
+    poolId === 'undefined' ||
+    Number.isNaN(Number(poolId))
+  ) {
+    return null;
+  }
+
+  const mins = Number(minutes || 0);
+  if (!Number.isFinite(mins) || mins <= 0) return null;
+
+  const { rows } = await DB.query(
+    `
     WITH last AS (
-      SELECT close FROM ohlcv_1m WHERE pool_id=$1 ORDER BY bucket_start DESC LIMIT 1
+      SELECT close
+      FROM ohlcv_1m
+      WHERE pool_id=$1
+      ORDER BY bucket_start DESC
+      LIMIT 1
     ),
     prev AS (
-      SELECT close FROM ohlcv_1m
-      WHERE pool_id=$1 AND bucket_start <= now() - ($2 || ' minutes')::interval
-      ORDER BY bucket_start DESC LIMIT 1
+      SELECT close
+      FROM ohlcv_1m
+      WHERE pool_id=$1
+        AND bucket_start <= now() - toIntervalMinute(toInt64($2))
+      ORDER BY bucket_start DESC
+      LIMIT 1
     )
-    SELECT CASE WHEN prev.close IS NOT NULL AND prev.close > 0
-                THEN ((last.close - prev.close)/prev.close)*100 END AS pct
+    SELECT
+      CASE
+        WHEN prev.close IS NOT NULL AND prev.close > 0
+        THEN ((last.close - prev.close) / prev.close) * 100
+      END AS pct
     FROM last, prev
-  `, [poolId, minutes]);
+    `,
+    [String(poolId), String(mins)]
+  );
+
   return rows[0]?.pct != null ? Number(rows[0].pct) : null;
 }
