@@ -2,6 +2,10 @@
 import { DB } from '../lib/db.js';
 import BatchQueue from '../lib/batch.js';
 
+// Remember last close per pool so next bucket's open = previous close
+// Key: String(pool_id), Value: { bucket_start: string, close: number }
+const lastCloseByPool = new Map();
+
 // ClickHouse DateTime only supports seconds.
 // Keep just "YYYY-MM-DDTHH:MM:SS" from whatever we got.
 function normalizeBucketStart(bucket_start) {
@@ -110,8 +114,44 @@ const ohlcvQueue = new BatchQueue({
   flushFn: async (items) => {
     if (!items.length) return;
 
-    // 1) aggregate inside this batch
+    // 1) aggregate inside this batch to 1 row per (pool_id, bucket_start)
     const agg = aggregateBatch(items);
+
+    // 1.5) ensure cross-bucket continuity:
+    // for each pool, sort by bucket_start and make
+    // next bucket's open = previous bucket's close.
+    if (agg.length) {
+      agg.sort((a, b) => {
+        const ap = String(a.pool_id ?? '');
+        const bp = String(b.pool_id ?? '');
+        if (ap < bp) return -1;
+        if (ap > bp) return 1;
+        const as = String(a.bucket_start ?? '');
+        const bs = String(b.bucket_start ?? '');
+        if (as < bs) return -1;
+        if (as > bs) return 1;
+        return 0;
+      });
+
+      for (const r of agg) {
+        const key = String(r.pool_id ?? '');
+        const prev = lastCloseByPool.get(key);
+
+        const curTs = String(r.bucket_start ?? '');
+        if (prev && curTs > prev.bucket_start) {
+          // Make this bucket's open = previous bucket's close
+          r.open = prev.close;
+          // We leave high/low as actual trade extremes inside this bucket.
+          // It's fine if open is slightly outside [low, high].
+        }
+
+        // Update last close for this pool
+        lastCloseByPool.set(key, {
+          bucket_start: curTs,
+          close: r.close,
+        });
+      }
+    }
 
     // 2) build and run INSERT
     const { sql, args } = buildInsertSQL(agg);

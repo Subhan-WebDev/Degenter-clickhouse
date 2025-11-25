@@ -54,10 +54,25 @@ async function getPoolCached(pairContract) {
   if (p) poolsByContract.set(pairContract, p);
   return p;
 }
+
 function rememberMeta(denom, lowPrioTasks) {
   if (!denom || metaFetched.has(denom)) return;
   metaFetched.add(denom);
   lowPrioTasks.push(() => setTokenMetaFromLCD(denom));
+}
+
+// helper: check if this trade (pool + tx_hash + msg_index) already exists
+async function tradeExists(poolId, txHash, msgIndex) {
+  const { rows } = await DB.query(
+    `SELECT 1
+     FROM trades
+     WHERE pool_id = $1
+       AND tx_hash = $2
+       AND msg_index = $3
+     LIMIT 1`,
+    [poolId, txHash, msgIndex]
+  );
+  return rows.length > 0;
 }
 
 export async function processHeight(h) {
@@ -98,7 +113,9 @@ export async function processHeight(h) {
     const msgs = byType(txr.events, 'message');
     const msgSenderByIndex = buildMsgSenderMap(msgs);
 
+    // ───────────────────────────────────────────────────────────
     // create_pair
+    // ───────────────────────────────────────────────────────────
     const cps = wasmByAction(wasms, 'create_pair');
     for (const cp of cps) {
       if ((cp.m.get('_contract_address') || '').trim() !== FACTORY_ADDR) continue;
@@ -139,7 +156,9 @@ export async function processHeight(h) {
       rememberMeta(quote, lowPrioTasks);
     }
 
+    // ───────────────────────────────────────────────────────────
     // swaps
+    // ───────────────────────────────────────────────────────────
     const swaps = wasmByAction(wasms, 'swap');
     for (let idx = 0; idx < swaps.length; idx++) {
       const s = swaps[idx];
@@ -176,6 +195,16 @@ export async function processHeight(h) {
         const pool = await getPoolCached(pairContract);
         if (!pool) { warn(`[swap] unknown pool ${pairContract}`); return; }
 
+        // 🔒 dedupe: skip if this trade already exists (restart-safe)
+        if (await tradeExists(pool.pool_id, tx_hash, msgIndex)) {
+          debug('[swap] duplicate trade, skipping', {
+            pool_id: pool.pool_id,
+            tx_hash,
+            msg_index: msgIndex,
+          });
+          return;
+        }
+
         await insertTrade({
           pool_id: pool.pool_id, pair_contract: pairContract,
           action: 'swap', direction: classifyDirection(offer, pool.quote_denom),
@@ -191,50 +220,88 @@ export async function processHeight(h) {
           pool.pool_id, pool.base_denom, pool.quote_denom, res1d, res1a, res2d, res2a
         );
 
-        // OHLCV & live price — compute from LCD reserves
+        // OHLCV & live price — compute from **event reserves** (no LCD drift)
         if (pool.is_uzig_quote) {
           try {
             const { rows: rExp } = await DB.query(
               'SELECT exponent AS exp FROM tokens WHERE token_id = $1',
               [pool.base_id]
             );
-            const baseExp = rExp?.[0]?.exp;
-            if (baseExp == null) {
-              debug('[price/skip] meta not ready for base token', { token_id: pool.base_id, denom: pool.base_denom });
+            const baseExpRaw = rExp?.[0]?.exp;
+            if (baseExpRaw == null) {
+              debug('[price/skip] meta not ready for base token', {
+                token_id: pool.base_id,
+                denom:   pool.base_denom,
+              });
+              return;
+            }
+            const baseExp = Number(baseExpRaw);
+
+            // Figure out which reserve is base and which is quote (uzig)
+            let RbRaw = null; // base token raw amount
+            let RqRaw = null; // uzig raw amount
+
+            if (res1d === pool.base_denom && res2d === pool.quote_denom) {
+              RbRaw = res1a;
+              RqRaw = res2a;
+            } else if (res2d === pool.base_denom && res1d === pool.quote_denom) {
+              RbRaw = res2a;
+              RqRaw = res1a;
+            }
+
+            if (RbRaw == null || RqRaw == null) {
+              debug('[price/skip] cannot map reserves to base/quote', {
+                pool: pool.pool_id,
+                base_denom:  pool.base_denom,
+                quote_denom: pool.quote_denom,
+                res1d, res2d,
+              });
               return;
             }
 
-            const reserves = await fetchPoolReserves(pairContract);
-            const price = priceFromReserves_UZIGQuote(
-              { base_denom: pool.base_denom, base_exp: Number(baseExp) },
-              reserves
-            );
+            const Rb = Number(RbRaw || 0);
+            const Rq = Number(RqRaw || 0);
+            if (!(Rb > 0) || !(Rq > 0)) {
+              debug('[price/skip] non-positive reserves', { Rb, Rq });
+              return;
+            }
+
+            // Both base + uzig are on minimal units; baseExp / 6 define human units
+            // price(base in ZIG) = (Rq / 10^6) / (Rb / 10^baseExp)
+            const price =
+              (Rq / 1e6) /
+              (Rb / Math.pow(10, baseExp));
+
             if (price != null && Number.isFinite(price) && price > 0) {
               const quoteRaw = (offer === pool.quote_denom)
                 ? Number(offerAmt || 0)
-                : Number(retAmt || 0);
-              const volZig = quoteRaw / 1e6; // UZIG always 6 decimals
+                : Number(retAmt   || 0);
+              const volZig = quoteRaw / 1e6; // UZIG always has 6 decimals
 
-              const bucket = new Date(Math.floor(new Date(timestamp).getTime() / 60000) * 60000);
+              const bucket = new Date(
+                Math.floor(new Date(timestamp).getTime() / 60000) * 60000
+              );
+
               await upsertOHLCV1m({
                 pool_id: pool.pool_id,
                 bucket_start: bucket,
                 price,
                 vol_zig: volZig,
-                trade_inc: 1
+                trade_inc: 1,
               });
 
               await upsertPrice(pool.base_id, pool.pool_id, price, true);
             }
           } catch (e) {
-            warn('[swap price/lcd]', pairContract, e.message);
+            warn('[swap price/event_reserves]', pairContract, e.message);
           }
         }
+
       });
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // liquidity (provide/withdraw)  ← fixed for withdraw
+    // liquidity (provide/withdraw)
     // ─────────────────────────────────────────────────────────────────────
     const provides  = wasmByAction(wasms, 'provide_liquidity');
     const withdraws = wasmByAction(wasms, 'withdraw_liquidity');
@@ -289,6 +356,17 @@ export async function processHeight(h) {
       tasks.push(async () => {
         const pool = await getPoolCached(pairContract);
         if (!pool) return;
+
+        // 🔒 dedupe for liquidity events too
+        if (await tradeExists(pool.pool_id, tx_hash, msgIndex)) {
+          debug('[liq] duplicate trade, skipping', {
+            pool_id: pool.pool_id,
+            tx_hash,
+            msg_index: msgIndex,
+            action,
+          });
+          return;
+        }
 
         await insertTrade({
           pool_id: pool.pool_id, pair_contract: pairContract,
